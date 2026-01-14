@@ -29,6 +29,31 @@ def build_alias_to_table_map(select_expr: exp.Select) -> Dict[str, str]:
         alias_map[alias] = table_name
     return alias_map
 
+def is_noncolumn_identifier(node: exp.Expression) -> bool:
+    """
+    Identifiers inside functions or special constructs should not be treated as columns.
+    """
+    if not isinstance(node, exp.Identifier):
+        return False
+
+    parent = node.parent
+
+    # DATEADD(day, ...)
+    if isinstance(parent, exp.Func):
+        return True
+
+    # INTERVAL day
+    if isinstance(parent, exp.Interval):
+        return True
+
+    # EXTRACT(year FROM ...)
+    if isinstance(parent, exp.Extract):
+        return True
+
+    return False
+
+
+
 def extract_ctes(expr: exp.Expression) -> Dict[str, exp.Select]:
     """Extract CTE name → SELECT expression mapping."""
     ctes = {}
@@ -50,10 +75,21 @@ def extract_subqueries(select_expr: exp.Select) -> Dict[str, exp.Select]:
     return subqueries
 
 def guess_table_for_unqualified(col_name: str, alias_to_table: Dict[str, str]) -> str:
-    """Guess table for unqualified column."""
+    """
+    Guess the closest table for an unqualified column.
+    Strategy:
+      - If only one table is in scope, use it.
+      - Otherwise pick the first table in alias_to_table (closest in FROM order).
+    """
+    if not alias_to_table:
+        return "<unknown>"
+
     if len(alias_to_table) == 1:
         return list(alias_to_table.values())[0]
-    return "<ambiguous>"
+
+    # Pick the first table in FROM/JOIN order
+    return next(iter(alias_to_table.values()))
+
 
 def resolve_column_lineage(expr: exp.Expression,
                            alias_to_table: Dict[str, str],
@@ -63,6 +99,8 @@ def resolve_column_lineage(expr: exp.Expression,
     lineage = set()
 
     for col in expr.find_all(exp.Column):
+        if is_noncolumn_identifier(col):
+            continue
         table_alias = col.table
         col_name = col.name
 
@@ -163,7 +201,7 @@ if __name__ == "__main__":
         JOIN recent_orders ro ON c.customer_id = ro.customer_id
     )
     SELECT 
-        co.customer_id,
+        customer_id,
         co.customer_name,
         co.order_id,
         co.order_date,
