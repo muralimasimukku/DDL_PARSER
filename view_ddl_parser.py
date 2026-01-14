@@ -114,14 +114,22 @@ def resolve_column_lineage(expr: exp.Expression,
 
     return lineage
 
-def extract_full_lineage_grouped(sql: str, dialect: str = "mysql") -> Dict[str, List[str]]:
-    """Return lineage grouped by base table in JSON-friendly format."""
+def extract_full_lineage_grouped_with_view(sql: str, dialect: str = "mysql") -> Dict[str, Dict[str, List[str]]]:
+    """Return lineage grouped by base table, with view name as top-level key."""
     parsed = sqlglot.parse_one(sql, read=dialect)
-    ctes = extract_ctes(parsed)
-    select_expr = find_select_node(parsed)
+
+    # Handle CREATE VIEW properly
+    if isinstance(parsed, exp.Create) and parsed.args.get("kind") == "VIEW":
+        view_name = parsed.this.name
+        select_expr = find_select_node(parsed.expression)  # Correct: use .expression for SELECT
+    else:
+        view_name = "unknown_view"
+        select_expr = find_select_node(parsed)
+
     if not select_expr:
         raise ValueError("No SELECT statement found in SQL.")
 
+    ctes = extract_ctes(parsed)
     alias_to_table = build_alias_to_table_map(select_expr)
     subqueries = extract_subqueries(select_expr)
 
@@ -139,25 +147,31 @@ def extract_full_lineage_grouped(sql: str, dialect: str = "mysql") -> Dict[str, 
                 table_column_map[tbl] = set()
             table_column_map[tbl].add(col)
 
-    # Convert sets to sorted lists for JSON output
-    return {tbl: sorted(cols) for tbl, cols in table_column_map.items()}
+    return {view_name: {tbl: sorted(cols) for tbl, cols in table_column_map.items()}}
 
 if __name__ == "__main__":
-    view_sql = """CREATE VIEW sales_summary AS
+    view_sql = """
+    CREATE VIEW sales_summary AS
+    WITH recent_orders AS (
+        SELECT order_id, customer_id, order_date
+        FROM orders
+        WHERE order_date >= '2024-01-01'
+    ),
+    customer_orders AS (
+        SELECT c.customer_id, c.customer_name, ro.order_id, ro.order_date
+        FROM customers c
+        JOIN recent_orders ro ON c.customer_id = ro.customer_id
+    )
     SELECT 
         co.customer_id,
         co.customer_name,
         co.order_id,
         co.order_date,
         SUM(oi.quantity * oi.unit_price) AS total_amount
-    FROM (SELECT c.customer_id, c.customer_name, ro.order_id, ro.order_date
-        FROM customers c
-        JOIN (SELECT order_id, customer_id, order_date
-        FROM orders
-        WHERE order_date >= '2024-01-01') ro ON c.customer_id = ro.customer_id) co
+    FROM customer_orders co
     JOIN order_items oi ON co.order_id = oi.order_id
     GROUP BY co.customer_id, co.customer_name, co.order_id, co.order_date;
     """
 
-    grouped_lineage = extract_full_lineage_grouped(view_sql)
+    grouped_lineage = extract_full_lineage_grouped_with_view(view_sql)
     print(json.dumps(grouped_lineage, indent=4))
