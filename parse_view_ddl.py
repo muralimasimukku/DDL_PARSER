@@ -1,19 +1,37 @@
 import json
 import sqlglot
-from sqlglot.expressions import Select, Table, Column, Join, Subquery
+from sqlglot.expressions import (
+    Select, Table, Column, Join, Subquery, CTE, With
+)
 
 
 class DDLMetadataParser:
     def __init__(self, ddl: str):
         self.ddl = ddl
         self.ast = sqlglot.parse_one(ddl)
+        self.cte_map = self.build_cte_map()
 
     # ---------------------------------------------------
-    # Build alias → table_name or alias → Subquery
+    # Build CTE map from WITH clause
     # ---------------------------------------------------
-    def build_alias_map(self, select_expr):
-        alias_map = {}
-        physical_tables = []
+    def build_cte_map(self):
+        cte_map = {}
+        with_expr = self.ast.args.get("with")
+
+        if isinstance(with_expr, With):
+            for cte in with_expr.expressions:
+                if isinstance(cte, CTE):
+                    name = cte.alias_or_name
+                    cte_map[name] = cte.this  # Select inside CTE
+
+        return cte_map
+
+    # ---------------------------------------------------
+    # Build alias → table_name or alias → Subquery or alias → CTE Select
+    # ---------------------------------------------------
+    def build_alias_map(self, select_expr, base_alias_map=None):
+        alias_map = dict(base_alias_map or {})
+        physical_tables = alias_map.get("__physical_tables__", [])
 
         # Physical tables
         for table in select_expr.find_all(Table):
@@ -26,40 +44,41 @@ class DDLMetadataParser:
         for sub in select_expr.find_all(Subquery):
             alias_map[sub.alias_or_name] = sub
 
-        # Also store physical tables list for heuristics
         alias_map["__physical_tables__"] = physical_tables
         return alias_map
 
     # ---------------------------------------------------
-    # Heuristic: resolve unknown alias when only one table exists
+    # Heuristic for unknown alias
     # ---------------------------------------------------
     def resolve_unknown_alias(self, table_alias, alias_map, col_name):
         physical_tables = alias_map.get("__physical_tables__", [])
         if len(physical_tables) == 1:
-            # Assume this unknown alias refers to the only table in scope
             return [f"{physical_tables[0]}.{col_name}"]
         return [f"{table_alias}.{col_name}"]
 
     # ---------------------------------------------------
     # Resolve alias.column → base table columns (recursive)
-    # Returns a list of fully qualified columns
     # ---------------------------------------------------
     def resolve_column(self, col, alias_map):
         table_alias = col.table
         name = col.name
 
-        # Case 1: alias refers to a subquery → recurse into it
+        # Case 0: alias refers to a CTE
+        if table_alias in alias_map and alias_map[table_alias] in self.cte_map:
+            sub_select = self.cte_map[alias_map[table_alias]]
+            sub_meta = self.extract_select(sub_select)
+            for c in sub_meta["columns"]:
+                if c["column_name"] == name:
+                    return c["lineage"]
+            return [f"{table_alias}.{name}"]
+
+        # Case 1: alias refers to a subquery
         if table_alias in alias_map and isinstance(alias_map[table_alias], Subquery):
             sub = alias_map[table_alias]
             sub_meta = self.extract_select(sub.this)
-
-            # Find matching column inside subquery
             for c in sub_meta["columns"]:
                 if c["column_name"] == name:
-                    # Propagate its lineage upward
                     return c["lineage"]
-
-            # Fallback if not found
             return [f"{table_alias}.{name}"]
 
         # Case 2: alias refers to a physical table
@@ -67,15 +86,15 @@ class DDLMetadataParser:
             table_name = alias_map[table_alias]
             return [f"{table_name}.{name}"]
 
-        # Case 3: unknown alias but only one table in scope → heuristic
+        # Case 3: unknown alias
         if table_alias:
             return self.resolve_unknown_alias(table_alias, alias_map, name)
 
-        # Case 4: no table alias at all
+        # Case 4: no table alias
         return [name]
 
     # ---------------------------------------------------
-    # Extract dependencies (tables + columns) for an expression
+    # Extract dependencies (tables + columns)
     # ---------------------------------------------------
     def extract_dependencies(self, expr, alias_map):
         tables = set()
@@ -94,28 +113,28 @@ class DDLMetadataParser:
         }
 
     # ---------------------------------------------------
-    # Extract SELECT metadata (recursive for subqueries)
+    # Extract SELECT metadata (recursive)
     # ---------------------------------------------------
     def extract_select(self, select_expr):
-        alias_map = self.build_alias_map(select_expr)
+        alias_map = self.build_alias_map(select_expr, base_alias_map=self.cte_map)
         columns_meta = []
 
         for proj in select_expr.expressions:
             alias = proj.alias
             expr = proj.this
 
+            deps = self.extract_dependencies(expr, alias_map)
+            lineage = deps["columns"]
+
+            # base table always comes from lineage
+            base_table = lineage[0].split(".")[0] if lineage and "." in lineage[0] else None
+
             if isinstance(expr, Column):
                 column_name = alias or expr.name
                 formula = expr.sql()
-                deps = self.extract_dependencies(expr, alias_map)
-                lineage = deps["columns"]
-                base_table = lineage[0].split(".")[0] if lineage else None
             else:
                 column_name = alias or proj.sql()
                 formula = expr.sql() if expr else proj.sql()
-                deps = self.extract_dependencies(expr, alias_map)
-                lineage = deps["columns"]
-                base_table = None
 
             columns_meta.append({
                 "column_name": column_name,
@@ -143,7 +162,6 @@ class DDLMetadataParser:
         if not isinstance(select_expr, Select):
             return metadata
 
-        # Columns with full lineage
         select_meta = self.extract_select(select_expr)
         metadata["columns"] = select_meta["columns"]
 
@@ -170,34 +188,5 @@ class DDLMetadataParser:
         return metadata
 
     def print_json(self):
-        print(json.dumps(self.extract(), indent=4))
+        return json.dumps(self.extract(), indent=4)
 
-
-if __name__ == "__main__":
-    ddl = """
-    CREATE VIEW sales_summary AS
-    SELECT 
-        co.customer_id,
-        co.customer_name,
-        co.order_id,
-        co.order_date,
-        SUM(oi.quantity * oi.unit_price) AS total_amount
-    FROM (
-        SELECT 
-            c.customer_id,
-            c.customer_name,
-            ro.order_id,
-            ro.order_date
-        FROM customers AS c
-        JOIN (
-            SELECT co.order_id, co.customer_id, co.order_date
-            FROM orders
-            WHERE co.order_date >= '2024-01-01'
-        ) AS ro ON c.customer_id = ro.customer_id
-    ) AS co
-    JOIN order_items AS oi ON co.order_id = oi.order_id
-    GROUP BY co.customer_id, co.customer_name, co.order_id, co.order_date
-    """
-
-    parser = DDLMetadataParser(ddl)
-    parser.print_json()

@@ -1,10 +1,9 @@
 import normalize_view_ddl
 import parse_view_ddl
 
-ddl = """
-CREATE VIEW sales_summary AS
+view_sql = """CREATE VIEW sales_summary AS
     SELECT 
-        customer_id,
+        co.customer_id,
         co.customer_name,
         co.order_id,
         co.order_date,
@@ -16,7 +15,7 @@ CREATE VIEW sales_summary AS
         WHERE order_date >= '2024-01-01') ro ON c.customer_id = ro.customer_id) co
     JOIN order_items oi ON co.order_id = oi.order_id
     GROUP BY co.customer_id, co.customer_name, co.order_id, co.order_date;
-"""
-normalized_view_ddl = normalize_view_ddl.DDLNormalizer().normalize(ddl)
-print(normalized_view_ddl)
+    """
+parser = parse_view_ddl.DDLMetadataParser(view_sql)
+print(parser.print_json())
 
